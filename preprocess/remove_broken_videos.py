@@ -37,7 +37,7 @@ def remove_broken_videos_multiprocessing(input_dir, num_workers):
 
 
 if __name__ == "__main__":
-    input_dir = "/mnt/bn/maliva-gen-ai-v2/chunyu.li/VoxCeleb2/raw"
+    input_dir = "/mnt/bn/maliva-gen-ai-v2/chunyu.li/multilingual/affine_transformed"
     num_workers = 50
 
     remove_broken_videos_multiprocessing(input_dir, num_workers)

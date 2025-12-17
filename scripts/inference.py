@@ -13,27 +13,17 @@
 # limitations under the License.
 
 import argparse
-import os
 from omegaconf import OmegaConf
 import torch
 from diffusers import AutoencoderKL, DDIMScheduler
 from latentsync.models.unet import UNet3DConditionModel
 from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+from diffusers.utils.import_utils import is_xformers_available
 from accelerate.utils import set_seed
 from latentsync.whisper.audio2feature import Audio2Feature
-from DeepCache import DeepCacheSDHelper
 
 
 def main(config, args):
-    if not os.path.exists(args.video_path):
-        raise RuntimeError(f"Video path '{args.video_path}' not found")
-    if not os.path.exists(args.audio_path):
-        raise RuntimeError(f"Audio path '{args.audio_path}' not found")
-
-    # Check if the GPU supports float16
-    is_fp16_supported = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
-    dtype = torch.float16 if is_fp16_supported else torch.float32
-
     print(f"Input video path: {args.video_path}")
     print(f"Input audio path: {args.audio_path}")
     print(f"Loaded checkpoint path: {args.inference_ckpt_path}")
@@ -47,24 +37,23 @@ def main(config, args):
     else:
         raise NotImplementedError("cross_attention_dim must be 768 or 384")
 
-    audio_encoder = Audio2Feature(
-        model_path=whisper_model_path,
-        device="cuda",
-        num_frames=config.data.num_frames,
-        audio_feat_length=config.data.audio_feat_length,
-    )
+    audio_encoder = Audio2Feature(model_path=whisper_model_path, device="cuda", num_frames=config.data.num_frames)
 
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=dtype)
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=torch.float16)
     vae.config.scaling_factor = 0.18215
     vae.config.shift_factor = 0
 
     unet, _ = UNet3DConditionModel.from_pretrained(
         OmegaConf.to_container(config.model),
-        args.inference_ckpt_path,
+        args.inference_ckpt_path,  # load checkpoint
         device="cpu",
     )
 
-    unet = unet.to(dtype=dtype)
+    unet = unet.to(dtype=torch.float16)
+
+    # set xformers
+    if is_xformers_available():
+        unet.enable_xformers_memory_efficient_attention()
 
     pipeline = LipsyncPipeline(
         vae=vae,
@@ -72,12 +61,6 @@ def main(config, args):
         unet=unet,
         scheduler=scheduler,
     ).to("cuda")
-
-    # use DeepCache
-    if args.enable_deepcache:
-        helper = DeepCacheSDHelper(pipe=pipeline)
-        helper.set_params(cache_interval=3, cache_branch_id=0)
-        helper.enable()
 
     if args.seed != -1:
         set_seed(args.seed)
@@ -90,14 +73,13 @@ def main(config, args):
         video_path=args.video_path,
         audio_path=args.audio_path,
         video_out_path=args.video_out_path,
+        video_mask_path=args.video_out_path.replace(".mp4", "_mask.mp4"),
         num_frames=config.data.num_frames,
-        num_inference_steps=args.inference_steps,
+        num_inference_steps=config.run.inference_steps,
         guidance_scale=args.guidance_scale,
-        weight_dtype=dtype,
+        weight_dtype=torch.float16,
         width=config.data.resolution,
         height=config.data.resolution,
-        mask_image_path=config.data.mask_image_path,
-        temp_dir=args.temp_dir,
     )
 
 
@@ -108,11 +90,8 @@ if __name__ == "__main__":
     parser.add_argument("--video_path", type=str, required=True)
     parser.add_argument("--audio_path", type=str, required=True)
     parser.add_argument("--video_out_path", type=str, required=True)
-    parser.add_argument("--inference_steps", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
-    parser.add_argument("--temp_dir", type=str, default="temp")
     parser.add_argument("--seed", type=int, default=1247)
-    parser.add_argument("--enable_deepcache", action="store_true")
     args = parser.parse_args()
 
     config = OmegaConf.load(args.unet_config_path)

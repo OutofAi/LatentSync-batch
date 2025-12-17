@@ -19,8 +19,8 @@ from omegaconf import OmegaConf
 import shutil
 
 from latentsync.data.syncnet_dataset import SyncNetDataset
-from latentsync.models.stable_syncnet import StableSyncNet
-from latentsync.models.wav2lip_syncnet import Wav2LipSyncNet
+from latentsync.models.syncnet import SyncNet
+from latentsync.models.syncnet_wav2lip import SyncNetWav2Lip
 from latentsync.utils.util import gather_loss, plot_loss_chart
 from accelerate.utils import set_seed
 
@@ -31,7 +31,7 @@ from einops import rearrange
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from latentsync.utils.util import init_dist, cosine_loss, dummy_context
+from latentsync.utils.util import init_dist, cosine_loss
 
 logger = get_logger(__name__)
 
@@ -96,7 +96,7 @@ def main(config):
         drop_last=True,
         worker_init_fn=train_dataset.worker_init_fn,
     )
-
+    
     num_samples_limit = 640
 
     val_batch_size = min(
@@ -114,47 +114,45 @@ def main(config):
     )
 
     # Model
-    syncnet = StableSyncNet(OmegaConf.to_container(config.model)).to(device)
-    # syncnet = Wav2LipSyncNet().to(device)
+    syncnet = SyncNet(OmegaConf.to_container(config.model)).to(device)
+    # syncnet = SyncNetWav2Lip().to(device)
 
     optimizer = torch.optim.AdamW(
         list(filter(lambda p: p.requires_grad, syncnet.parameters())), lr=config.optimizer.lr
     )
 
-    global_step = 0
-    train_step_list = []
-    train_loss_list = []
-    val_step_list = []
-    val_loss_list = []
-
     if config.ckpt.resume_ckpt_path != "":
         if is_main_process:
             logger.info(f"Load checkpoint from: {config.ckpt.resume_ckpt_path}")
-        ckpt = torch.load(config.ckpt.resume_ckpt_path, map_location=device, weights_only=True)
+        ckpt = torch.load(config.ckpt.resume_ckpt_path, map_location=device)
 
         syncnet.load_state_dict(ckpt["state_dict"])
-
-        if "global_step" in ckpt:
-            global_step = ckpt["global_step"]
-            train_step_list = ckpt["train_step_list"]
-            train_loss_list = ckpt["train_loss_list"]
-            val_step_list = ckpt["val_step_list"]
-            val_loss_list = ckpt["val_loss_list"]
+        global_step = ckpt["global_step"]
+        train_step_list = ckpt["train_step_list"]
+        train_loss_list = ckpt["train_loss_list"]
+        val_step_list = ckpt["val_step_list"]
+        val_loss_list = ckpt["val_loss_list"]
+    else:
+        global_step = 0
+        train_step_list = []
+        train_loss_list = []
+        val_step_list = []
+        val_loss_list = []
 
     # DDP wrapper
     syncnet = DDP(syncnet, device_ids=[local_rank], output_device=local_rank)
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader))
     num_train_epochs = math.ceil(config.run.max_train_steps / num_update_steps_per_epoch)
+    # validation_steps = int(config.ckpt.save_ckpt_steps // 5)
+    # validation_steps = 100
 
     if is_main_process:
         logger.info("***** Running training *****")
         logger.info(f"  Num examples = {len(train_dataset)}")
         logger.info(f"  Num Epochs = {num_train_epochs}")
         logger.info(f"  Instantaneous batch size per device = {config.data.batch_size}")
-        logger.info(
-            f"  Total train batch size (w. parallel & distributed & accumulation) = {config.data.batch_size * num_processes * config.data.gradient_accumulation_steps}"
-        )
+        logger.info(f"  Total train batch size (w. parallel & distributed) = {config.data.batch_size * num_processes}")
         logger.info(f"  Total optimization steps = {config.run.max_train_steps}")
 
     first_epoch = global_step // num_update_steps_per_epoch
@@ -166,15 +164,13 @@ def main(config):
     )
 
     # Support mixed-precision training
-    scaler = torch.amp.GradScaler("cuda") if config.run.mixed_precision_training else None
+    scaler = torch.cuda.amp.GradScaler() if config.run.mixed_precision_training else None
 
     for epoch in range(first_epoch, num_train_epochs):
         train_dataloader.sampler.set_epoch(epoch)
         syncnet.train()
-        step_loss = 0
-        optimizer.zero_grad()
 
-        for index, batch in enumerate(train_dataloader):
+        for step, batch in enumerate(train_dataloader):
             ### >>>> Training >>>> ###
 
             frames = batch["frames"].to(device, dtype=torch.float16)
@@ -210,91 +206,91 @@ def main(config):
                 height = frames.shape[2]
                 frames = frames[:, :, height // 2 :, :]
 
-            # Disable gradient sync for the first N-1 steps, enable sync on the final step
-            with syncnet.no_sync() if (index + 1) % config.data.gradient_accumulation_steps != 0 else dummy_context():
-                # Mixed-precision training
-                with torch.autocast(
-                    device_type="cuda", dtype=torch.float16, enabled=config.run.mixed_precision_training
-                ):
-                    vision_embeds, audio_embeds = syncnet(frames, audio_samples)
+            # audio_embeds = wav2vec_encoder(audio_samples).last_hidden_state
 
-                loss = cosine_loss(vision_embeds.float(), audio_embeds.float(), y).mean()
-                loss = loss / config.data.gradient_accumulation_steps
+            # Mixed-precision training
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=config.run.mixed_precision_training):
+                vision_embeds, audio_embeds = syncnet(frames, audio_samples)
 
-                # Backpropagate
+            loss = cosine_loss(vision_embeds.float(), audio_embeds.float(), y).mean()
+
+            optimizer.zero_grad()
+
+            # Backpropagate
+            if config.run.mixed_precision_training:
                 scaler.scale(loss).backward()
-
-            step_loss += gather_loss(loss, device)
-
-            # Update parameters when the accumulation steps are reached
-            if (index + 1) % config.data.gradient_accumulation_steps == 0:
-                """>>> gradient clipping >>>"""
+                """ >>> gradient clipping >>> """
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(syncnet.parameters(), config.optimizer.max_grad_norm)
                 """ <<< gradient clipping <<< """
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
+            else:
+                loss.backward()
+                """ >>> gradient clipping >>> """
+                torch.nn.utils.clip_grad_norm_(syncnet.parameters(), config.optimizer.max_grad_norm)
+                """ <<< gradient clipping <<< """
+                optimizer.step()
 
-                progress_bar.update(1)
-                global_step += 1
+            progress_bar.update(1)
+            global_step += 1
 
-                train_step_list.append(global_step)
-                train_loss_list.append(step_loss)
+            global_average_loss = gather_loss(loss, device)
+            train_step_list.append(global_step)
+            train_loss_list.append(global_average_loss)
 
-                if is_main_process and global_step % config.run.validation_steps == 0:
-                    logger.info(f"Validation at step {global_step}")
-                    val_loss = validation(
-                        val_dataloader,
-                        device,
-                        syncnet,
-                        config.data.latent_space,
-                        config.data.lower_half,
-                        vae,
-                        num_val_batches,
-                    )
-                    val_step_list.append(global_step)
-                    val_loss_list.append(val_loss)
-                    logger.info(f"Validation loss at step {global_step} is {val_loss:0.3f}")
-                    plot_loss_chart(
-                        os.path.join(output_dir, f"loss_charts/loss_chart-{global_step}.png"),
-                        ("Train loss", train_step_list, train_loss_list),
-                        ("Val loss", val_step_list, val_loss_list),
-                    )
+            if is_main_process and global_step % config.run.validation_steps == 0:
+                logger.info(f"Validation at step {global_step}")
+                val_loss = validation(
+                    val_dataloader,
+                    device,
+                    syncnet,
+                    cosine_loss,
+                    config.data.latent_space,
+                    config.data.lower_half,
+                    vae,
+                    num_val_batches,
+                )
+                val_step_list.append(global_step)
+                val_loss_list.append(val_loss)
+                logger.info(f"Validation loss at step {global_step} is {val_loss:0.3f}")
 
-                if is_main_process and global_step % config.ckpt.save_ckpt_steps == 0:
-                    checkpoint_save_path = os.path.join(output_dir, f"checkpoints/checkpoint-{global_step}.pt")
-                    torch.save(
-                        {
-                            "state_dict": syncnet.module.state_dict(),  # to unwrap DDP
-                            "global_step": global_step,
-                            "train_step_list": train_step_list,
-                            "train_loss_list": train_loss_list,
-                            "val_step_list": val_step_list,
-                            "val_loss_list": val_loss_list,
-                        },
-                        checkpoint_save_path,
-                    )
-                    logger.info(f"Saved checkpoint to {checkpoint_save_path}")
+            if is_main_process and global_step % config.ckpt.save_ckpt_steps == 0:
+                checkpoint_save_path = os.path.join(output_dir, f"checkpoints/checkpoint-{global_step}.pt")
+                torch.save(
+                    {
+                        "state_dict": syncnet.module.state_dict(),  # to unwrap DDP
+                        "global_step": global_step,
+                        "train_step_list": train_step_list,
+                        "train_loss_list": train_loss_list,
+                        "val_step_list": val_step_list,
+                        "val_loss_list": val_loss_list,
+                    },
+                    checkpoint_save_path,
+                )
+                logger.info(f"Saved checkpoint to {checkpoint_save_path}")
+                plot_loss_chart(
+                    os.path.join(output_dir, f"loss_charts/loss_chart-{global_step}.png"),
+                    ("Train loss", train_step_list, train_loss_list),
+                    ("Val loss", val_step_list, val_loss_list),
+                )
 
-                progress_bar.set_postfix({"step_loss": step_loss, "epoch": epoch})
-                step_loss = 0
-
-                if global_step >= config.run.max_train_steps:
-                    break
+            progress_bar.set_postfix({"step_loss": global_average_loss})
+            if global_step >= config.run.max_train_steps:
+                break
 
     progress_bar.close()
     dist.destroy_process_group()
 
 
 @torch.no_grad()
-def validation(val_dataloader, device, syncnet, latent_space, lower_half, vae, num_val_batches):
+def validation(val_dataloader, device, syncnet, cosine_loss, latent_space, lower_half, vae, num_val_batches):
     syncnet.eval()
 
     losses = []
     val_step = 0
     while True:
-        for index, batch in enumerate(val_dataloader):
+        for step, batch in enumerate(val_dataloader):
             ### >>>> Validation >>>> ###
 
             frames = batch["frames"].to(device, dtype=torch.float16)
@@ -329,8 +325,8 @@ def validation(val_dataloader, device, syncnet, latent_space, lower_half, vae, n
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Code to train the SyncNet")
-    parser.add_argument("--config_path", type=str, default="configs/syncnet/syncnet_16_pixel.yaml")
+    parser = argparse.ArgumentParser(description="Code to train the expert lip-sync discriminator")
+    parser.add_argument("--config_path", type=str, default="configs/syncnet/syncnet_16_vae.yaml")
     args = parser.parse_args()
 
     # Load a configuration file

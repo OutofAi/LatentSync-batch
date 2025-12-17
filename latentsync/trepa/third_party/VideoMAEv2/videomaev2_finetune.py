@@ -145,7 +145,7 @@ class Mlp(nn.Module):
         x = self.fc1(x)
         x = self.act(x)
         # x = self.drop(x)
-        # commit this for the original BERT implement
+        # commit this for the orignal BERT implement
         x = self.fc2(x)
         x = self.drop(x)
         return x
@@ -241,17 +241,13 @@ class Attention(nn.Module):
         qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
-        # Use PyTorch native implementation of FlashAttention-2
-        attn = F.scaled_dot_product_attention(q, k, v)
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
 
-        x = attn.transpose(1, 2).reshape(B, N, -1)
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
 
-        # Deprecated attn implementation, which consumes much more VRAM
-        # q = q * self.scale
-        # attn = q @ k.transpose(-2, -1)
-        # attn = attn.softmax(dim=-1)
-        # attn = self.attn_drop(attn)
-        # x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
 
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -510,12 +506,12 @@ class VisionTransformer(nn.Module):
 
         for blk in self.blocks:
             if self.with_cp:
-                x = cp.checkpoint(blk, x, use_reentrant=False)
+                x = cp.checkpoint(blk, x)
             else:
                 x = blk(x)
 
         # return self.fc_norm(x)
-
+        
         if self.fc_norm is not None:
             return self.fc_norm(x.mean(1))
         else:

@@ -142,12 +142,13 @@ class ResnetBlock3D(nn.Module):
         self.conv1 = InflatedConv3d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
         if temb_channels is not None:
-            if self.time_embedding_norm == "default":
-                time_emb_proj_out_channels = out_channels
-            elif self.time_embedding_norm == "scale_shift":
-                time_emb_proj_out_channels = out_channels * 2
-            else:
-                raise ValueError(f"unknown time_embedding_norm : {self.time_embedding_norm} ")
+            time_emb_proj_out_channels = out_channels
+            # if self.time_embedding_norm == "default":
+            #     time_emb_proj_out_channels = out_channels
+            # elif self.time_embedding_norm == "scale_shift":
+            #     time_emb_proj_out_channels = out_channels * 2
+            # else:
+            #     raise ValueError(f"unknown time_embedding_norm : {self.time_embedding_norm} ")
 
             self.time_emb_proj = torch.nn.Linear(temb_channels, time_emb_proj_out_channels)
         else:

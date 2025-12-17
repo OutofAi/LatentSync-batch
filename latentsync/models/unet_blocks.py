@@ -26,11 +26,15 @@ def get_down_block(
     only_cross_attention=False,
     upcast_attention=False,
     resnet_time_scale_shift="default",
+    unet_use_cross_frame_attention=False,
+    unet_use_temporal_attention=False,
     use_inflated_groupnorm=False,
     use_motion_module=None,
     motion_module_type=None,
     motion_module_kwargs=None,
     add_audio_layer=False,
+    audio_condition_method="cross_attn",
+    custom_audio_layer=False,
 ):
     down_block_type = down_block_type[7:] if down_block_type.startswith("UNetRes") else down_block_type
     if down_block_type == "DownBlock3D":
@@ -70,11 +74,15 @@ def get_down_block(
             only_cross_attention=only_cross_attention,
             upcast_attention=upcast_attention,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+            unet_use_temporal_attention=unet_use_temporal_attention,
             use_inflated_groupnorm=use_inflated_groupnorm,
             use_motion_module=use_motion_module,
             motion_module_type=motion_module_type,
             motion_module_kwargs=motion_module_kwargs,
             add_audio_layer=add_audio_layer,
+            audio_condition_method=audio_condition_method,
+            custom_audio_layer=custom_audio_layer,
         )
     raise ValueError(f"{down_block_type} does not exist.")
 
@@ -97,11 +105,15 @@ def get_up_block(
     only_cross_attention=False,
     upcast_attention=False,
     resnet_time_scale_shift="default",
+    unet_use_cross_frame_attention=False,
+    unet_use_temporal_attention=False,
     use_inflated_groupnorm=False,
     use_motion_module=None,
     motion_module_type=None,
     motion_module_kwargs=None,
     add_audio_layer=False,
+    audio_condition_method="cross_attn",
+    custom_audio_layer=False,
 ):
     up_block_type = up_block_type[7:] if up_block_type.startswith("UNetRes") else up_block_type
     if up_block_type == "UpBlock3D":
@@ -141,11 +153,15 @@ def get_up_block(
             only_cross_attention=only_cross_attention,
             upcast_attention=upcast_attention,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+            unet_use_temporal_attention=unet_use_temporal_attention,
             use_inflated_groupnorm=use_inflated_groupnorm,
             use_motion_module=use_motion_module,
             motion_module_type=motion_module_type,
             motion_module_kwargs=motion_module_kwargs,
             add_audio_layer=add_audio_layer,
+            audio_condition_method=audio_condition_method,
+            custom_audio_layer=custom_audio_layer,
         )
     raise ValueError(f"{up_block_type} does not exist.")
 
@@ -168,11 +184,15 @@ class UNetMidBlock3DCrossAttn(nn.Module):
         dual_cross_attention=False,
         use_linear_projection=False,
         upcast_attention=False,
+        unet_use_cross_frame_attention=False,
+        unet_use_temporal_attention=False,
         use_inflated_groupnorm=False,
         use_motion_module=None,
         motion_module_type=None,
         motion_module_kwargs=None,
         add_audio_layer=False,
+        audio_condition_method="cross_attn",
+        custom_audio_layer: bool = False,
     ):
         super().__init__()
 
@@ -197,6 +217,7 @@ class UNetMidBlock3DCrossAttn(nn.Module):
             )
         ]
         attentions = []
+        audio_attentions = []
         motion_modules = []
 
         for _ in range(num_layers):
@@ -212,8 +233,32 @@ class UNetMidBlock3DCrossAttn(nn.Module):
                     norm_num_groups=resnet_groups,
                     use_linear_projection=use_linear_projection,
                     upcast_attention=upcast_attention,
+                    use_motion_module=use_motion_module,
+                    unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                    unet_use_temporal_attention=unet_use_temporal_attention,
                     add_audio_layer=add_audio_layer,
+                    audio_condition_method=audio_condition_method,
                 )
+            )
+            audio_attentions.append(
+                Transformer3DModel(
+                    attn_num_head_channels,
+                    in_channels // attn_num_head_channels,
+                    in_channels=in_channels,
+                    num_layers=1,
+                    cross_attention_dim=cross_attention_dim,
+                    norm_num_groups=resnet_groups,
+                    use_linear_projection=use_linear_projection,
+                    upcast_attention=upcast_attention,
+                    use_motion_module=use_motion_module,
+                    unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                    unet_use_temporal_attention=unet_use_temporal_attention,
+                    add_audio_layer=add_audio_layer,
+                    audio_condition_method=audio_condition_method,
+                    custom_audio_layer=True,
+                )
+                if custom_audio_layer
+                else None
             )
             motion_modules.append(
                 get_motion_module(
@@ -241,20 +286,26 @@ class UNetMidBlock3DCrossAttn(nn.Module):
             )
 
         self.attentions = nn.ModuleList(attentions)
+        self.audio_attentions = nn.ModuleList(audio_attentions)
         self.resnets = nn.ModuleList(resnets)
         self.motion_modules = nn.ModuleList(motion_modules)
 
     def forward(self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None):
         hidden_states = self.resnets[0](hidden_states, temb)
-        for attn, resnet, motion_module in zip(self.attentions, self.resnets[1:], self.motion_modules):
-            hidden_states = attn(
-                hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                return_dict=False,
-            )[0]
-
-            if motion_module is not None:
-                hidden_states = motion_module(hidden_states, temb, encoder_hidden_states=encoder_hidden_states)
+        for attn, audio_attn, resnet, motion_module in zip(
+            self.attentions, self.audio_attentions, self.resnets[1:], self.motion_modules
+        ):
+            hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states).sample
+            hidden_states = (
+                audio_attn(hidden_states, encoder_hidden_states=encoder_hidden_states).sample
+                if audio_attn is not None
+                else hidden_states
+            )
+            hidden_states = (
+                motion_module(hidden_states, temb, encoder_hidden_states=encoder_hidden_states)
+                if motion_module is not None
+                else hidden_states
+            )
             hidden_states = resnet(hidden_states, temb)
 
         return hidden_states
@@ -282,15 +333,20 @@ class CrossAttnDownBlock3D(nn.Module):
         use_linear_projection=False,
         only_cross_attention=False,
         upcast_attention=False,
+        unet_use_cross_frame_attention=False,
+        unet_use_temporal_attention=False,
         use_inflated_groupnorm=False,
         use_motion_module=None,
         motion_module_type=None,
         motion_module_kwargs=None,
         add_audio_layer=False,
+        audio_condition_method="cross_attn",
+        custom_audio_layer: bool = False,
     ):
         super().__init__()
         resnets = []
         attentions = []
+        audio_attentions = []
         motion_modules = []
 
         self.has_cross_attention = True
@@ -326,8 +382,33 @@ class CrossAttnDownBlock3D(nn.Module):
                     use_linear_projection=use_linear_projection,
                     only_cross_attention=only_cross_attention,
                     upcast_attention=upcast_attention,
+                    use_motion_module=use_motion_module,
+                    unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                    unet_use_temporal_attention=unet_use_temporal_attention,
                     add_audio_layer=add_audio_layer,
+                    audio_condition_method=audio_condition_method,
                 )
+            )
+            audio_attentions.append(
+                Transformer3DModel(
+                    attn_num_head_channels,
+                    out_channels // attn_num_head_channels,
+                    in_channels=out_channels,
+                    num_layers=1,
+                    cross_attention_dim=cross_attention_dim,
+                    norm_num_groups=resnet_groups,
+                    use_linear_projection=use_linear_projection,
+                    only_cross_attention=only_cross_attention,
+                    upcast_attention=upcast_attention,
+                    use_motion_module=use_motion_module,
+                    unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                    unet_use_temporal_attention=unet_use_temporal_attention,
+                    add_audio_layer=add_audio_layer,
+                    audio_condition_method=audio_condition_method,
+                    custom_audio_layer=True,
+                )
+                if custom_audio_layer
+                else None
             )
             motion_modules.append(
                 get_motion_module(
@@ -340,6 +421,7 @@ class CrossAttnDownBlock3D(nn.Module):
             )
 
         self.attentions = nn.ModuleList(attentions)
+        self.audio_attentions = nn.ModuleList(audio_attentions)
         self.resnets = nn.ModuleList(resnets)
         self.motion_modules = nn.ModuleList(motion_modules)
 
@@ -359,8 +441,10 @@ class CrossAttnDownBlock3D(nn.Module):
     def forward(self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None):
         output_states = ()
 
-        for resnet, attn, motion_module in zip(self.resnets, self.attentions, self.motion_modules):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+        for resnet, attn, audio_attn, motion_module in zip(
+            self.resnets, self.attentions, self.audio_attentions, self.motion_modules
+        ):
+            if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
@@ -371,30 +455,36 @@ class CrossAttnDownBlock3D(nn.Module):
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(resnet), hidden_states, temb, use_reentrant=False
-                )
+                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(attn, return_dict=False),
                     hidden_states,
                     encoder_hidden_states,
-                    use_reentrant=False,
                 )[0]
-
                 if motion_module is not None:
                     hidden_states = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(motion_module),
-                        hidden_states,
+                        hidden_states.requires_grad_(),
                         temb,
                         encoder_hidden_states,
-                        use_reentrant=False,
                     )
+
             else:
                 hidden_states = resnet(hidden_states, temb)
                 hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states).sample
 
-                if motion_module is not None:
-                    hidden_states = motion_module(hidden_states, temb, encoder_hidden_states=encoder_hidden_states)
+                hidden_states = (
+                    audio_attn(hidden_states, encoder_hidden_states=encoder_hidden_states).sample
+                    if audio_attn is not None
+                    else hidden_states
+                )
+
+                # add motion module
+                hidden_states = (
+                    motion_module(hidden_states, temb, encoder_hidden_states=encoder_hidden_states)
+                    if motion_module is not None
+                    else hidden_states
+                )
 
             output_states += (hidden_states,)
 
@@ -479,7 +569,7 @@ class DownBlock3D(nn.Module):
         output_states = ()
 
         for resnet, motion_module in zip(self.resnets, self.motion_modules):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+            if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
@@ -487,23 +577,23 @@ class DownBlock3D(nn.Module):
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(resnet), hidden_states, temb, use_reentrant=False
-                )
-
+                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
                 if motion_module is not None:
                     hidden_states = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(motion_module),
-                        hidden_states,
+                        hidden_states.requires_grad_(),
                         temb,
                         encoder_hidden_states,
-                        use_reentrant=False,
                     )
             else:
                 hidden_states = resnet(hidden_states, temb)
 
-                if motion_module is not None:
-                    hidden_states = motion_module(hidden_states, temb, encoder_hidden_states=encoder_hidden_states)
+                # add motion module
+                hidden_states = (
+                    motion_module(hidden_states, temb, encoder_hidden_states=encoder_hidden_states)
+                    if motion_module is not None
+                    else hidden_states
+                )
 
             output_states += (hidden_states,)
 
@@ -538,15 +628,20 @@ class CrossAttnUpBlock3D(nn.Module):
         use_linear_projection=False,
         only_cross_attention=False,
         upcast_attention=False,
+        unet_use_cross_frame_attention=False,
+        unet_use_temporal_attention=False,
         use_inflated_groupnorm=False,
         use_motion_module=None,
         motion_module_type=None,
         motion_module_kwargs=None,
         add_audio_layer=False,
+        audio_condition_method="cross_attn",
+        custom_audio_layer=False,
     ):
         super().__init__()
         resnets = []
         attentions = []
+        audio_attentions = []
         motion_modules = []
 
         self.has_cross_attention = True
@@ -584,8 +679,33 @@ class CrossAttnUpBlock3D(nn.Module):
                     use_linear_projection=use_linear_projection,
                     only_cross_attention=only_cross_attention,
                     upcast_attention=upcast_attention,
+                    use_motion_module=use_motion_module,
+                    unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                    unet_use_temporal_attention=unet_use_temporal_attention,
                     add_audio_layer=add_audio_layer,
+                    audio_condition_method=audio_condition_method,
                 )
+            )
+            audio_attentions.append(
+                Transformer3DModel(
+                    attn_num_head_channels,
+                    out_channels // attn_num_head_channels,
+                    in_channels=out_channels,
+                    num_layers=1,
+                    cross_attention_dim=cross_attention_dim,
+                    norm_num_groups=resnet_groups,
+                    use_linear_projection=use_linear_projection,
+                    only_cross_attention=only_cross_attention,
+                    upcast_attention=upcast_attention,
+                    use_motion_module=use_motion_module,
+                    unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                    unet_use_temporal_attention=unet_use_temporal_attention,
+                    add_audio_layer=add_audio_layer,
+                    audio_condition_method=audio_condition_method,
+                    custom_audio_layer=True,
+                )
+                if custom_audio_layer
+                else None
             )
             motion_modules.append(
                 get_motion_module(
@@ -598,6 +718,7 @@ class CrossAttnUpBlock3D(nn.Module):
             )
 
         self.attentions = nn.ModuleList(attentions)
+        self.audio_attentions = nn.ModuleList(audio_attentions)
         self.resnets = nn.ModuleList(resnets)
         self.motion_modules = nn.ModuleList(motion_modules)
 
@@ -617,13 +738,15 @@ class CrossAttnUpBlock3D(nn.Module):
         upsample_size=None,
         attention_mask=None,
     ):
-        for resnet, attn, motion_module in zip(self.resnets, self.attentions, self.motion_modules):
+        for resnet, attn, audio_attn, motion_module in zip(
+            self.resnets, self.attentions, self.audio_attentions, self.motion_modules
+        ):
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
             hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
 
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+            if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
@@ -634,30 +757,35 @@ class CrossAttnUpBlock3D(nn.Module):
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(resnet), hidden_states, temb, use_reentrant=False
-                )
+                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(attn, return_dict=False),
                     hidden_states,
                     encoder_hidden_states,
-                    use_reentrant=False,
                 )[0]
-
                 if motion_module is not None:
                     hidden_states = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(motion_module),
-                        hidden_states,
+                        hidden_states.requires_grad_(),
                         temb,
                         encoder_hidden_states,
-                        use_reentrant=False,
                     )
+
             else:
                 hidden_states = resnet(hidden_states, temb)
                 hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states).sample
+                hidden_states = (
+                    audio_attn(hidden_states, encoder_hidden_states=encoder_hidden_states).sample
+                    if audio_attn is not None
+                    else hidden_states
+                )
 
-                if motion_module is not None:
-                    hidden_states = motion_module(hidden_states, temb, encoder_hidden_states=encoder_hidden_states)
+                # add motion module
+                hidden_states = (
+                    motion_module(hidden_states, temb, encoder_hidden_states=encoder_hidden_states)
+                    if motion_module is not None
+                    else hidden_states
+                )
 
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
@@ -744,7 +872,7 @@ class UpBlock3D(nn.Module):
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
             hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
 
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+            if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
@@ -752,23 +880,21 @@ class UpBlock3D(nn.Module):
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(resnet), hidden_states, temb, use_reentrant=False
-                )
-
+                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
                 if motion_module is not None:
                     hidden_states = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(motion_module),
-                        hidden_states,
+                        hidden_states.requires_grad_(),
                         temb,
                         encoder_hidden_states,
-                        use_reentrant=False,
                     )
             else:
                 hidden_states = resnet(hidden_states, temb)
-
-                if motion_module is not None:
-                    hidden_states = motion_module(hidden_states, temb, encoder_hidden_states=encoder_hidden_states)
+                hidden_states = (
+                    motion_module(hidden_states, temb, encoder_hidden_states=encoder_hidden_states)
+                    if motion_module is not None
+                    else hidden_states
+                )
 
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:

@@ -1,114 +1,138 @@
-# Copyright (c) 2024 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Adapted from https://github.com/guanjz20/StyleSync/blob/main/utils.py
 
-from latentsync.utils.util import write_video
-from latentsync.utils.image_processor import VideoProcessor
-import torch
-import os
-import subprocess
-from multiprocessing import Process
-import shutil
-
-paths = []
+import numpy as np
+import cv2
 
 
-def gather_video_paths(input_dir, output_dir):
-    for video in sorted(os.listdir(input_dir)):
-        if video.endswith(".mp4"):
-            video_input = os.path.join(input_dir, video)
-            video_output = os.path.join(output_dir, video)
-            if os.path.isfile(video_output):
-                continue
-            paths.append((video_input, video_output))
-        elif os.path.isdir(os.path.join(input_dir, video)):
-            gather_video_paths(os.path.join(input_dir, video), os.path.join(output_dir, video))
+def transformation_from_points(points1, points0, smooth=True, p_bias=None):
+    points2 = np.array(points0)
+    points2 = points2.astype(np.float64)
+    points1 = points1.astype(np.float64)
+    c1 = np.mean(points1, axis=0)
+    c2 = np.mean(points2, axis=0)
+    points1 -= c1
+    points2 -= c2
+    s1 = np.std(points1)
+    s2 = np.std(points2)
+    points1 /= s1
+    points2 /= s2
+    U, S, Vt = np.linalg.svd(np.matmul(points1.T, points2))
+    R = (np.matmul(U, Vt)).T
+    sR = (s2 / s1) * R
+    T = c2.reshape(2, 1) - (s2 / s1) * np.matmul(R, c1.reshape(2, 1))
+    M = np.concatenate((sR, T), axis=1)
+    if smooth:
+        bias = points2[2] - points1[2]
+        if p_bias is None:
+            p_bias = bias
+        else:
+            bias = p_bias * 0.2 + bias * 0.8
+        p_bias = bias
+        M[:, 2] = M[:, 2] + bias
+    return M, p_bias
 
 
-def combine_video_audio(video_frames, video_input_path, video_output_path, process_temp_dir):
-    video_name = os.path.basename(video_input_path)[:-4]
-    audio_temp = os.path.join(process_temp_dir, f"{video_name}_temp.wav")
-    video_temp = os.path.join(process_temp_dir, f"{video_name}_temp.mp4")
+class AlignRestore(object):
+    def __init__(self, align_points=3):
+        if align_points == 3:
+            self.upscale_factor = 1
+            self.crop_ratio = (2.8, 2.8)
+            self.face_template = np.array([[19 - 2, 30 - 10], [56 + 2, 30 - 10], [37.5, 45 - 5]])
+            self.face_template = self.face_template * 2.8
+            # self.face_size = (int(100 * self.crop_ratio[0]), int(100 * self.crop_ratio[1]))
+            self.face_size = (int(75 * self.crop_ratio[0]), int(100 * self.crop_ratio[1]))
+            self.p_bias = None
 
-    write_video(video_temp, video_frames, fps=25)
+    def process(self, img, lmk_align=None, smooth=True, align_points=3):
+        aligned_face, affine_matrix = self.align_warp_face(img, lmk_align, smooth)
+        restored_img = self.restore_img(img, aligned_face, affine_matrix)
+        cv2.imwrite("restored.jpg", restored_img)
+        cv2.imwrite("aligned.jpg", aligned_face)
+        return aligned_face, restored_img
 
-    command = f"ffmpeg -y -loglevel error -i {video_input_path} -q:a 0 -map a {audio_temp}"
-    subprocess.run(command, shell=True)
+    def align_warp_face(self, img, lmks3, smooth=True, border_mode="constant"):
+        affine_matrix, self.p_bias = transformation_from_points(lmks3, self.face_template, smooth, self.p_bias)
+        if border_mode == "constant":
+            border_mode = cv2.BORDER_CONSTANT
+        elif border_mode == "reflect101":
+            border_mode = cv2.BORDER_REFLECT101
+        elif border_mode == "reflect":
+            border_mode = cv2.BORDER_REFLECT
+        cropped_face = cv2.warpAffine(
+            img, affine_matrix, self.face_size, borderMode=border_mode, borderValue=[127, 127, 127]
+        )
+        return cropped_face, affine_matrix
 
-    os.makedirs(os.path.dirname(video_output_path), exist_ok=True)
-    command = f"ffmpeg -y -loglevel error -i {video_temp} -i {audio_temp} -c:v libx264 -c:a aac -map 0:v -map 1:a -q:v 0 -q:a 0 {video_output_path}"
-    subprocess.run(command, shell=True)
+    def align_warp_face2(self, img, landmark, border_mode="constant"):
+        affine_matrix = cv2.estimateAffinePartial2D(landmark, self.face_template)[0]
+        if border_mode == "constant":
+            border_mode = cv2.BORDER_CONSTANT
+        elif border_mode == "reflect101":
+            border_mode = cv2.BORDER_REFLECT101
+        elif border_mode == "reflect":
+            border_mode = cv2.BORDER_REFLECT
+        cropped_face = cv2.warpAffine(
+            img, affine_matrix, self.face_size, borderMode=border_mode, borderValue=(135, 133, 132)
+        )
+        return cropped_face, affine_matrix
 
-    os.remove(audio_temp)
-    os.remove(video_temp)
-
-
-def func(paths, process_temp_dir, device_id, resolution):
-    os.makedirs(process_temp_dir, exist_ok=True)
-    video_processor = VideoProcessor(resolution, f"cuda:{device_id}")
-
-    for video_input, video_output in paths:
-        if os.path.isfile(video_output):
-            continue
-        try:
-            video_frames = video_processor.affine_transform_video(video_input)
-        except Exception as e:  # Handle the exception of face not detcted
-            print(f"Exception: {e} - {video_input}")
-            continue
-
-        os.makedirs(os.path.dirname(video_output), exist_ok=True)
-        combine_video_audio(video_frames, video_input, video_output, process_temp_dir)
-        print(f"Saved: {video_output}")
-
-
-def split(a, n):
-    k, m = divmod(len(a), n)
-    return (a[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)] for i in range(n))
-
-
-def affine_transform_multi_gpus(input_dir, output_dir, temp_dir, resolution, num_workers):
-    print(f"Recursively gathering video paths of {input_dir} ...")
-    gather_video_paths(input_dir, output_dir)
-    num_devices = torch.cuda.device_count()
-    if num_devices == 0:
-        raise RuntimeError("No GPUs found")
-
-    if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
-    os.makedirs(temp_dir, exist_ok=True)
-
-    split_paths = list(split(paths, num_workers * num_devices))
-
-    processes = []
-
-    for i in range(num_devices):
-        for j in range(num_workers):
-            process_index = i * num_workers + j
-            process = Process(
-                target=func, args=(split_paths[process_index], os.path.join(temp_dir, f"process_{i}"), i, resolution)
-            )
-            process.start()
-            processes.append(process)
-
-    for process in processes:
-        process.join()
+    def restore_img(self, input_img, face, affine_matrix):
+        h, w, _ = input_img.shape
+        h_up, w_up = int(h * self.upscale_factor), int(w * self.upscale_factor)
+        upsample_img = cv2.resize(input_img, (w_up, h_up), interpolation=cv2.INTER_LANCZOS4)
+        inverse_affine = cv2.invertAffineTransform(affine_matrix)
+        inverse_affine *= self.upscale_factor
+        if self.upscale_factor > 1:
+            extra_offset = 0.5 * self.upscale_factor
+        else:
+            extra_offset = 0
+        inverse_affine[:, 2] += extra_offset
+        inv_restored = cv2.warpAffine(face, inverse_affine, (w_up, h_up))
+        mask = np.ones((self.face_size[1], self.face_size[0]), dtype=np.float32)
+        inv_mask = cv2.warpAffine(mask, inverse_affine, (w_up, h_up))
+        inv_mask_erosion = cv2.erode(
+            inv_mask, np.ones((int(2 * self.upscale_factor), int(2 * self.upscale_factor)), np.uint8)
+        )
+        pasted_face = inv_mask_erosion[:, :, None] * inv_restored
+        total_face_area = np.sum(inv_mask_erosion)
+        w_edge = int(total_face_area**0.5) // 20
+        erosion_radius = w_edge * 2
+        inv_mask_center = cv2.erode(inv_mask_erosion, np.ones((erosion_radius, erosion_radius), np.uint8))
+        blur_size = w_edge * 2
+        inv_soft_mask = cv2.GaussianBlur(inv_mask_center, (blur_size + 1, blur_size + 1), 0)
+        inv_soft_mask = inv_soft_mask[:, :, None]
+        upsample_img = inv_soft_mask * pasted_face + (1 - inv_soft_mask) * upsample_img
+        if np.max(upsample_img) > 256:
+            upsample_img = upsample_img.astype(np.uint16)
+        else:
+            upsample_img = upsample_img.astype(np.uint8)
+        return upsample_img
 
 
-if __name__ == "__main__":
-    input_dir = "/mnt/bn/maliva-gen-ai-v2/chunyu.li/VoxCeleb2/segmented"
-    output_dir = "/mnt/bn/maliva-gen-ai-v2/chunyu.li/VoxCeleb2/affine_transformed"
-    temp_dir = "temp"
-    resolution = 256
-    num_workers = 10  # How many processes per device
+class laplacianSmooth:
+    def __init__(self, smoothAlpha=0.3):
+        self.smoothAlpha = smoothAlpha
+        self.pts_last = None
 
-    affine_transform_multi_gpus(input_dir, output_dir, temp_dir, resolution, num_workers)
+    def smooth(self, pts_cur):
+        if self.pts_last is None:
+            self.pts_last = pts_cur.copy()
+            return pts_cur.copy()
+        x1 = min(pts_cur[:, 0])
+        x2 = max(pts_cur[:, 0])
+        y1 = min(pts_cur[:, 1])
+        y2 = max(pts_cur[:, 1])
+        width = x2 - x1
+        pts_update = []
+        for i in range(len(pts_cur)):
+            x_new, y_new = pts_cur[i]
+            x_old, y_old = self.pts_last[i]
+            tmp = (x_new - x_old) ** 2 + (y_new - y_old) ** 2
+            w = np.exp(-tmp / (width * self.smoothAlpha))
+            x = x_old * w + x_new * (1 - w)
+            y = y_old * w + y_new * (1 - w)
+            pts_update.append([x, y])
+        pts_update = np.array(pts_update)
+        self.pts_last = pts_update.copy()
+
+        return pts_update

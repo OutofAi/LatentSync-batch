@@ -11,6 +11,8 @@ from torch import nn
 from .transcribe import transcribe as transcribe_function
 from .decoding import detect_language as detect_language_function, decode as decode_function
 
+from flash_attn_interface import flash_attn_func
+
 
 @dataclass
 class ModelDimensions:
@@ -73,19 +75,71 @@ class MultiHeadAttention(nn.Module):
         q = self.query(x)
 
         if kv_cache is None or xa is None:
-            # hooks, if installed (i.e. kv_cache is not None), will prepend the cached kv tensors;
-            # otherwise, perform key/value projections for self- or cross-attention as usual.
             k = self.key(x if xa is None else xa)
             v = self.value(x if xa is None else xa)
         else:
-            # for cross-attention, calculate keys and values once and reuse in subsequent calls.
             k = kv_cache.get(self.key, self.key(xa))
             v = kv_cache.get(self.value, self.value(xa))
 
         wv = self.qkv_attention(q, k, v, mask)
         return self.out(wv)
 
-    def qkv_attention(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None):
+    def qkv_attention(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        mask: Optional[Tensor] = None,
+    ):
+        """
+        FlashAttention version.
+
+        Requirements:
+        - q, k, v: [B, T, C] on CUDA
+        - dtype: usually float16 / bfloat16
+        - mask: only causal/no mask supported here; for other masks we fall back.
+        """
+        # --- Fallback if we have a non-causal arbitrary mask -----------------
+        # Your current mask is [Tq, Tk] added as an additive bias. FlashAttention
+        # does *not* support a general 2D mask via this simple interface.
+        # So, if you rely on that, we just use the old implementation.
+        if mask is not None:
+            # if this is a pure causal mask, you can replace this condition
+            # with something cheaper and use `causal=True` instead of fallback.
+            return self._qkv_attention_standard(q, k, v, mask)
+
+        B, T_q, C = q.shape
+        T_k = k.size(1)
+        assert C % self.n_head == 0
+        head_dim = C // self.n_head
+
+        # [B, T, H, Dh]
+        q = q.view(B, T_q, self.n_head, head_dim)
+        k = k.view(B, T_k, self.n_head, head_dim)
+        v = v.view(B, T_k, self.n_head, head_dim)
+
+        # FlashAttention expects contiguous, fp16/bf16 on CUDA.
+        orig_dtype = q.dtype
+        q = q.to(dtype=torch.float16).contiguous()
+        k = k.to(dtype=torch.float16).contiguous()
+        v = v.to(dtype=torch.float16).contiguous()
+
+        out = flash_attn_func(
+            q, k, v
+        )
+        # out: [B, T_q, H, Dh]
+        out = out.to(orig_dtype)
+        out = out.reshape(B, T_q, C)
+        return out
+
+    def _qkv_attention_standard(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        mask: Optional[Tensor] = None,
+    ):
+        """Your original implementation, kept as a fallback when mask is used."""
         n_batch, n_ctx, n_state = q.shape
         scale = (n_state // self.n_head) ** -0.25
         q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3) * scale
@@ -94,10 +148,13 @@ class MultiHeadAttention(nn.Module):
 
         qk = q @ k
         if mask is not None:
-            qk = qk + mask[:n_ctx, :n_ctx]
+            n_ctx_q = qk.shape[-2]
+            n_ctx_k = qk.shape[-1]
+            qk = qk + mask[:n_ctx_q, :n_ctx_k]
 
         w = F.softmax(qk.float(), dim=-1).to(q.dtype)
         return (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
+
 
 
 class ResidualAttentionBlock(nn.Module):
